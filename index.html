@@ -1,0 +1,1256 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ファンダメンタルズ分析アプリ</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>tailwind.config = { darkMode: 'class' }</script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-datalabels@2.2.0/dist/chartjs-plugin-datalabels.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.min.js"></script>
+  <style>
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .spin { animation: spin 0.9s linear infinite; }
+    @media print {
+      .no-print { display: none !important; }
+      section { page-break-inside: avoid; }
+      body { background: white !important; }
+    }
+  </style>
+</head>
+<body class="bg-gray-50 dark:bg-gray-950 text-gray-900 dark:text-gray-100 min-h-screen transition-colors duration-200">
+<div id="root"></div>
+<script>
+// ============================================================
+// デモ用会社データ
+// ============================================================
+const DEMO_COMPANIES = [
+  { code:"7203", name:"トヨタ自動車",       sector:"輸送用機器", url:"https://global.toyota/jp/ir/" },
+  { code:"6758", name:"ソニーグループ",       sector:"電気機器",   url:"https://www.sony.com/ja/SonyInfo/IR/" },
+  { code:"9984", name:"ソフトバンクグループ", sector:"情報通信",   url:"https://group.softbank/ir/" },
+  { code:"7974", name:"任天堂",               sector:"その他製品", url:"https://www.nintendo.co.jp/ir/" },
+  { code:"6861", name:"キーエンス",           sector:"電気機器",   url:"https://www.keyence.co.jp/company/investor/" },
+];
+
+// ============================================================
+// シード乱数 & デモデータ生成
+// ============================================================
+function seededRand(seed) {
+  let s = seed | 0;
+  return () => { s = (Math.imul(1664525, s) + 1013904223) | 0; return (s >>> 0) / 0x100000000; };
+}
+
+const PROFILES = {
+  "7203": { baseSales:27000, growth:[0,  0, 15, 18, 21], margin:0.08 },
+  "6758": { baseSales:8800,  growth:[3,  8, 12,  5, 10], margin:0.09 },
+  "9984": { baseSales:5600,  growth:[-5,10, 20, -3,  8], margin:0.05 },
+  "7974": { baseSales:1300,  growth:[4, 35,-15, 10, 12], margin:0.25 },
+  "6861": { baseSales:5500,  growth:[5, 20, 18, 25, 15], margin:0.55 },
+};
+
+function makeFigures(code, fiscalYear, quarter) {
+  const seed = code.split('').reduce((a,c)=>a+c.charCodeAt(0),0)*31 + fiscalYear*7 + (quarter||0)*3;
+  const rand = seededRand(seed);
+  const p = PROFILES[code] || { baseSales:1200+(seed%3000), growth:[2,5,8,6,10], margin:0.10 };
+
+  const yIdx = fiscalYear - 2020;
+  let base = p.baseSales;
+  for (let i=0; i<Math.max(0,yIdx); i++) base *= (1 + (p.growth[Math.min(i+1,p.growth.length-1)]/100));
+
+  let rev = base;
+  if (quarter !== null) {
+    const season = [0.22,0.24,0.26,0.28];
+    rev = rev * season[quarter-1] * (0.88 + rand()*0.24);
+  } else {
+    rev = rev * (0.96 + rand()*0.08);
+  }
+  rev = Math.round(rev);
+
+  const op  = Math.round(rev * p.margin * (0.78+rand()*0.44));
+  const ord = Math.round(op  * (0.91+rand()*0.14));
+  const net = Math.round(ord * (0.60+rand()*0.22));
+  const eps = Math.round(net / (p.baseSales/500));
+
+  const ta  = Math.round(rev * (1.35 + Math.max(0,yIdx)*0.09 + rand()*0.25));
+  const na  = Math.round(ta  * (0.30 + rand()*0.30));
+  const ocf = Math.round(op  * (1.0  + rand()*0.55));
+  const icf = -Math.round(op * (0.32 + rand()*0.68));
+  const fcf = -Math.round(net* (0.12 + rand()*0.55));
+  const div = Math.max(0, Math.round(eps*(0.22+rand()*0.20)));
+
+  return {
+    pl: { revenue:rev, operatingProfit:op, ordinaryProfit:ord, netProfit:net, eps },
+    bs: { totalAssets:ta, netAssets:na, equityRatio: Math.round(na/ta*1000)/10 },
+    cf: { operating:ocf, investing:icf, financing:fcf },
+    dividend: { annual:div, payoutRatio: Math.round((24+rand()*28)*10)/10 },
+    forecast: null,
+  };
+}
+
+function makeDemoPeriods(code, name, sector) {
+  const url = DEMO_COMPANIES.find(c=>c.code===code)?.url || '';
+  return [2020,2021,2022,2023,2024].map(yr => ({
+    id: `demo-${code}-${yr}`,
+    sourceType: 'demo',
+    sourceUrl: url,
+    pdfUrl: '',
+    companyName: name,
+    sector,
+    fiscalYear: yr,
+    quarter: null,
+    isAnnual: true,
+    label: `${yr}年3月期 通期`,
+    figures: makeFigures(code, yr, null),
+    fetchedAt: new Date().toISOString(),
+  }));
+}
+
+// ============================================================
+// セッション状態（sessionStorage）
+// ============================================================
+let periods = JSON.parse(sessionStorage.getItem('fa-periods') || '[]');
+let company = JSON.parse(sessionStorage.getItem('fa-company') || 'null');
+
+function persist() {
+  sessionStorage.setItem('fa-periods', JSON.stringify(periods));
+  sessionStorage.setItem('fa-company', JSON.stringify(company));
+}
+
+function addPeriod(p) {
+  const i = periods.findIndex(x => x.fiscalYear===p.fiscalYear && x.quarter===p.quarter && x.isAnnual===p.isAnnual);
+  if (i >= 0) periods[i] = p; else periods.push(p);
+  if (!company) company = { name:p.companyName, sector:p.sector };
+  persist();
+}
+
+function deletePeriodById(id) {
+  periods = periods.filter(p => p.id !== id);
+  if (periods.length === 0) company = null;
+  persist();
+}
+
+function clearSession() {
+  periods = []; company = null;
+  sessionStorage.removeItem('fa-periods');
+  sessionStorage.removeItem('fa-company');
+}
+
+// ============================================================
+// 分析データ構築
+// ============================================================
+function buildAnalysis() {
+  if (!periods.length) return null;
+
+  const sorted = [...periods].sort((a,b) =>
+    a.fiscalYear !== b.fiscalYear ? a.fiscalYear-b.fiscalYear : (a.isAnnual?5:a.quarter)-(b.isAnnual?5:b.quarter)
+  );
+
+  const annuals   = sorted.filter(p => p.isAnnual);
+  const quarters  = sorted.filter(p => !p.isAnnual);
+
+  const annual = annuals.map(p => {
+    const ta = p.figures.bs?.totalAssets ?? null;
+    const na = p.figures.bs?.netAssets   ?? null;
+    return {
+      year:             p.fiscalYear,
+      revenue:          p.figures.pl.revenue,
+      operatingProfit:  p.figures.pl.operatingProfit,
+      ordinaryProfit:   p.figures.pl.ordinaryProfit,
+      netProfit:        p.figures.pl.netProfit,
+      eps:              p.figures.pl.eps,
+      totalAssets:      ta,
+      totalLiabilities: (ta != null && na != null) ? ta - na : null,
+      netAssets:        na,
+      equityRatio:      p.figures.bs?.equityRatio ?? null,
+      operatingCF:      p.figures.cf?.operating   ?? null,
+      investingCF:      p.figures.cf?.investing   ?? null,
+      financingCF:      p.figures.cf?.financing   ?? null,
+      dividendAmount:   p.figures.dividend?.annual ?? null,
+      payoutRatio:      p.figures.dividend?.payoutRatio ?? null,
+      pdfUrl:           p.pdfUrl,
+      yoy: null,
+      bsYoy: null,
+    };
+  });
+
+  for (let i=1; i<annual.length; i++) {
+    const rv = annual[i-1].revenue   ? Math.round((annual[i].revenue  /annual[i-1].revenue  -1)*1000)/10 : null;
+    const np = annual[i-1].netProfit ? Math.round((annual[i].netProfit/annual[i-1].netProfit-1)*1000)/10 : null;
+    annual[i].yoy = { revenue:rv, netProfit:np };
+
+    const pTA = annual[i-1].totalAssets;
+    const pTL = annual[i-1].totalLiabilities;
+    const pNA = annual[i-1].netAssets;
+    annual[i].bsYoy = {
+      totalAssets:      pTA ? Math.round((annual[i].totalAssets/pTA-1)*1000)/10 : null,
+      totalLiabilities: pTL ? Math.round((annual[i].totalLiabilities/pTL-1)*1000)/10 : null,
+      netAssets:        pNA ? Math.round((annual[i].netAssets/pNA-1)*1000)/10 : null,
+    };
+  }
+
+  const quarterly = quarters.map(p => ({
+    year:           p.fiscalYear,
+    quarter:        p.quarter,
+    label:          `${p.fiscalYear}Q${p.quarter}`,
+    revenue:        p.figures.pl.revenue,
+    operatingProfit:p.figures.pl.operatingProfit,
+    netProfit:      p.figures.pl.netProfit,
+  }));
+
+  const co = company || { name: sorted[0].companyName, sector: sorted[0].sector };
+  return {
+    companyName:  co.name,
+    sector:       co.sector,
+    periodCount:  periods.length,
+    latestYear:   annuals.length ? annuals[annuals.length-1].fiscalYear : null,
+    annual,
+    quarterly,
+    forecast:     sorted[sorted.length-1].figures.forecast,
+  };
+}
+
+// ============================================================
+// コメント生成
+// ============================================================
+function makeComments(analysis) {
+  const { annual } = analysis;
+  const out = { annual:[], bs:[], cashflow:[], eps:[] };
+
+  if (annual.length >= 2) {
+    // 年次
+    const last = annual[annual.length-1];
+    const prev = annual[annual.length-2];
+
+    if (annual.length >= 3) {
+      const last3 = annual.slice(-3);
+      const rates  = last3.slice(1).map((a,i)=>(a.revenue-last3[i].revenue)/last3[i].revenue*100);
+      const avg    = rates.reduce((a,b)=>a+b,0)/rates.length;
+      if (avg > 10)     out.annual.push(`直近3年の平均売上成長率は${avg.toFixed(1)}%と高水準`);
+      else if (avg > 3) out.annual.push(`直近3年の平均売上成長率は${avg.toFixed(1)}%と安定成長`);
+      else if (avg < 0) out.annual.push(`直近3年の売上は平均${avg.toFixed(1)}%の減少傾向。要注視`);
+      else              out.annual.push(`売上成長率は${avg.toFixed(1)}%と横ばい傾向`);
+    }
+
+    if (last.revenue) out.annual.push(`最新期の営業利益率は${(last.operatingProfit/last.revenue*100).toFixed(1)}%`);
+
+    const epsUp = annual.slice(1).filter((a,i)=>a.eps>annual[i].eps).length;
+    if (epsUp>=3) out.annual.push(`EPSが${epsUp}期連続で成長し、収益性が継続改善`);
+
+    if (last.yoy?.netProfit!=null) {
+      const np = last.yoy.netProfit;
+      if (np>20) out.annual.push(`最新期純利益は前年比+${np}%と大幅増益`);
+      else if (np<-10) out.annual.push(`最新期純利益は前年比${np}%と減益。要注意`);
+      else out.annual.push(`最新期純利益は前年比${np>=0?'+':''}${np}%`);
+    }
+    const opG = ((last.operatingProfit-prev.operatingProfit)/Math.abs(prev.operatingProfit)*100).toFixed(1);
+    out.annual.push(`営業利益の前年成長率は${Number(opG)>=0?'+':''}${opG}%`);
+
+    // BS（貸借対照表）
+    const withBS = annual.filter(a => a.totalAssets != null && a.netAssets != null);
+    if (withBS.length >= 1) {
+      const lastBS  = withBS[withBS.length-1];
+      const firstBS = withBS[0];
+
+      // 自己資本比率の水準
+      if (lastBS.equityRatio != null) {
+        if      (lastBS.equityRatio > 60) out.bs.push(`自己資本比率${lastBS.equityRatio}%と非常に高く、財務の安定性は極めて高い`);
+        else if (lastBS.equityRatio > 50) out.bs.push(`自己資本比率${lastBS.equityRatio}%と財務基盤は健全`);
+        else if (lastBS.equityRatio > 30) out.bs.push(`自己資本比率${lastBS.equityRatio}%と標準的な財務構造`);
+        else if (lastBS.equityRatio > 20) out.bs.push(`自己資本比率${lastBS.equityRatio}%とやや低め。負債比率に注意`);
+        else                               out.bs.push(`自己資本比率${lastBS.equityRatio}%と財務レバレッジが高い。有利子負債の管理に要注意`);
+      }
+
+      // 自己資本比率トレンド
+      if (withBS.length >= 3) {
+        const earlyEq = withBS.slice(0,2).reduce((s,a)=>s+(a.equityRatio||0),0)/2;
+        const lateEq  = withBS.slice(-2).reduce((s,a)=>s+(a.equityRatio||0),0)/2;
+        const diff = lateEq - earlyEq;
+        if      (diff >  5) out.bs.push(`自己資本比率は${diff.toFixed(1)}pt上昇。財務体質が改善傾向`);
+        else if (diff < -5) out.bs.push(`自己資本比率が${Math.abs(diff).toFixed(1)}pt低下。負債依存度が高まっている`);
+        else                out.bs.push(`自己資本比率は${earlyEq.toFixed(0)}～${lateEq.toFixed(0)}%と安定推移`);
+      }
+
+      // 総資産の成長
+      if (withBS.length >= 2 && firstBS.totalAssets) {
+        const taG = ((lastBS.totalAssets - firstBS.totalAssets) / firstBS.totalAssets * 100).toFixed(0);
+        if      (Number(taG) > 20) out.bs.push(`${withBS.length}期間で総資産は${taG}%拡大。積極的な資産積み上げが続く`);
+        else if (Number(taG) >  0) out.bs.push(`総資産は${taG}%増加。緩やかな資産拡大`);
+        else                       out.bs.push(`総資産が${Math.abs(Number(taG))}%縮小。資産のスリム化が進行`);
+      }
+
+      // 総負債の絶対水準
+      if (lastBS.totalLiabilities != null && lastBS.equityRatio != null) {
+        out.bs.push(`最新期の総負債は${lastBS.totalLiabilities.toLocaleString()}億円（総資産の${(100-lastBS.equityRatio).toFixed(1)}%）`);
+      }
+
+      // 純資産の成長
+      if (withBS.length >= 2 && firstBS.netAssets) {
+        const naG = ((lastBS.netAssets - firstBS.netAssets) / firstBS.netAssets * 100).toFixed(0);
+        if      (Number(naG) > 20) out.bs.push(`純資産は${naG}%増加。内部留保の着実な積み上げを確認`);
+        else if (Number(naG) >  0) out.bs.push(`純資産は${naG}%増加と安定成長`);
+        else                       out.bs.push(`純資産が${Math.abs(Number(naG))}%減少。配当・損失等の影響を確認`);
+      }
+    }
+    out.bs = out.bs.slice(0, 5);
+
+    // CF
+    const withCF = annual.filter(a=>a.operatingCF!=null);
+    if (withCF.length) {
+      const neg = withCF.filter(a=>a.operatingCF<0).length;
+      out.cashflow.push(neg===0
+        ? '全期間で営業CFはプラスを維持。本業の現金創出力は堅調'
+        : `${neg}期で営業CFがマイナス。本業の現金創出力に懸念`);
+      const lCF = withCF[withCF.length-1];
+      out.cashflow.push(`最新期フリーCF（営業+投資）は${(lCF.operatingCF+lCF.investingCF).toLocaleString()}億円`);
+      out.cashflow.push(`投資CF ${Math.abs(lCF.investingCF).toLocaleString()}億円の支出。設備投資・M&Aへ積極配分`);
+    }
+    const lEq = annual[annual.length-1].equityRatio;
+    if (lEq!=null) {
+      if (lEq>50)      out.cashflow.push(`自己資本比率${lEq}%と財務基盤は健全`);
+      else if (lEq<20) out.cashflow.push(`自己資本比率${lEq}%と財務レバレッジ高め。有利子負債に注意`);
+      else             out.cashflow.push(`自己資本比率${lEq}%と標準的な財務構造`);
+    }
+
+    // EPS/配当
+    if (last.eps && prev.eps) {
+      const eg = ((last.eps-prev.eps)/Math.abs(prev.eps)*100).toFixed(1);
+      out.eps.push(`EPS成長率は前年比${Number(eg)>=0?'+':''}${eg}%`);
+    }
+    const divArr = annual.filter(a=>a.dividendAmount!=null);
+    if (divArr.length>=2) {
+      const ups = divArr.slice(1).filter((a,i)=>a.dividendAmount>=divArr[i].dividendAmount).length;
+      if (ups>=3) out.eps.push(`直近${ups}期で増配傾向。株主還元姿勢が継続`);
+      const avgPO = (divArr.reduce((s,a)=>s+(a.payoutRatio||0),0)/divArr.length).toFixed(1);
+      out.eps.push(`平均配当性向は${avgPO}%`);
+    }
+  }
+
+  return out;
+}
+
+// ============================================================
+// チャート
+// ============================================================
+const _charts = {};
+function killChart(id) { if (_charts[id]) { _charts[id].destroy(); delete _charts[id]; } }
+const dark = () => document.documentElement.classList.contains('dark');
+const cc = () => ({ text: dark()?'#d1d5db':'#374151', grid: dark()?'#374151':'#e5e7eb' });
+
+function drawChart(id, cfg) {
+  killChart(id);
+  const el = document.getElementById(id);
+  if (el) _charts[id] = new Chart(el, cfg);
+}
+
+function drawAnnual(id, rows) {
+  const c = cc();
+  drawChart(id, {
+    data: {
+      labels: rows.map(r=>`${r.year}年3月期`),
+      datasets: [
+        { type:'bar',  label:'売上高',   data:rows.map(r=>r.revenue||0),         backgroundColor:'rgba(37,99,235,0.55)', borderColor:'#2563eb', borderWidth:1 },
+        { type:'bar',  label:'営業利益', data:rows.map(r=>r.operatingProfit||0), backgroundColor:'rgba(249,115,22,0.55)', borderColor:'#f97316', borderWidth:1 },
+        { type:'line', label:'純利益',   data:rows.map(r=>r.netProfit||0),       borderColor:'#10b981', borderWidth:2.5, pointRadius:5, tension:0.35, fill:false },
+      ]
+    },
+    options: {
+      responsive:true, maintainAspectRatio:false,
+      interaction:{ mode:'index', intersect:false },
+      plugins:{ legend:{ labels:{ color:c.text, boxWidth:14 } },
+                tooltip:{ callbacks:{ label:ctx=>`${ctx.dataset.label}: ${ctx.parsed.y.toLocaleString()} 億円` } } },
+      scales:{ x:{ ticks:{ color:c.text }, grid:{ color:c.grid } },
+               y:{ ticks:{ color:c.text, callback:v=>v.toLocaleString() }, grid:{ color:c.grid } } }
+    }
+  });
+}
+
+function drawQuarterly(id, rows) {
+  const c = cc();
+  drawChart(id, {
+    type:'line',
+    data:{
+      labels: rows.map(r=>r.label),
+      datasets:[
+        { label:'売上高',   data:rows.map(r=>r.revenue||0),         borderColor:'#2563eb', backgroundColor:'rgba(37,99,235,0.08)',  tension:0.35, fill:true,  pointRadius:3 },
+        { label:'営業利益', data:rows.map(r=>r.operatingProfit||0), borderColor:'#f97316', tension:0.35, fill:false, pointRadius:3 },
+        { label:'純利益',   data:rows.map(r=>r.netProfit||0),       borderColor:'#10b981', tension:0.35, fill:false, pointRadius:3 },
+      ]
+    },
+    options:{
+      responsive:true, maintainAspectRatio:false,
+      plugins:{ legend:{ labels:{ color:c.text, boxWidth:14 } },
+                tooltip:{ callbacks:{ label:ctx=>`${ctx.dataset.label}: ${ctx.parsed.y.toLocaleString()} 億円` } } },
+      scales:{ x:{ ticks:{ color:c.text, maxRotation:45, font:{size:10} }, grid:{ color:c.grid } },
+               y:{ ticks:{ color:c.text, callback:v=>v.toLocaleString() }, grid:{ color:c.grid } } }
+    }
+  });
+}
+
+function drawCF(id, rows) {
+  const c = cc();
+  drawChart(id, {
+    type:'bar',
+    data:{
+      labels: rows.map(r=>`${r.year}年3月期`),
+      datasets:[
+        { label:'営業CF', data:rows.map(r=>r.operatingCF||0), backgroundColor:'rgba(37,99,235,0.7)'  },
+        { label:'投資CF', data:rows.map(r=>r.investingCF||0), backgroundColor:'rgba(249,115,22,0.7)' },
+        { label:'財務CF', data:rows.map(r=>r.financingCF||0), backgroundColor:'rgba(139,92,246,0.7)' },
+      ]
+    },
+    options:{
+      responsive:true, maintainAspectRatio:false,
+      plugins:{ legend:{ labels:{ color:c.text, boxWidth:14 } },
+                tooltip:{ callbacks:{ label:ctx=>`${ctx.dataset.label}: ${ctx.parsed.y.toLocaleString()} 億円` } } },
+      scales:{ x:{ ticks:{ color:c.text }, grid:{ color:c.grid } },
+               y:{ ticks:{ color:c.text, callback:v=>v.toLocaleString() }, grid:{ color:c.grid } } }
+    }
+  });
+}
+
+function drawBS(id, rows) {
+  const c = cc();
+  drawChart(id, {
+    type: 'bar',
+    plugins: [ChartDataLabels],
+    data: {
+      labels: rows.map(r=>`${r.year}年3月期`),
+      datasets: [
+        {
+          label: '純資産',
+          data:  rows.map(r => r.netAssets || 0),
+          backgroundColor: 'rgba(16,185,129,0.70)',
+          borderColor: '#10b981',
+          borderWidth: 1,
+          stack: 'bs',
+        },
+        {
+          label: '総負債',
+          data:  rows.map(r => r.totalLiabilities || 0),
+          backgroundColor: 'rgba(249,115,22,0.65)',
+          borderColor: '#f97316',
+          borderWidth: 1,
+          stack: 'bs',
+        },
+      ]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      interaction: { mode: 'index', intersect: false },
+      plugins: {
+        legend: { labels: { color: c.text, boxWidth: 14 } },
+        tooltip: {
+          callbacks: {
+            label:  ctx  => `${ctx.dataset.label}: ${ctx.parsed.y.toLocaleString()} 億円`,
+            footer: items => {
+              const ta = items.reduce((s,i) => s + i.parsed.y, 0);
+              return `総資産合計: ${ta.toLocaleString()} 億円`;
+            },
+          }
+        },
+        datalabels: {
+          color: '#fff',
+          anchor: 'center',
+          align: 'center',
+          font: { weight: 'bold', size: 11 },
+          formatter: (value, ctx) => {
+            const total = ctx.chart.data.datasets.reduce(
+              (s, ds) => s + (ds.data[ctx.dataIndex] || 0), 0
+            );
+            if (!total || !value) return '';
+            const pct = Math.round(value / total * 100);
+            return pct >= 7 ? `${pct}%` : '';
+          }
+        }
+      },
+      scales: {
+        x: { ticks: { color: c.text }, grid: { color: c.grid }, stacked: true },
+        y: { ticks: { color: c.text, callback: v => v.toLocaleString() }, grid: { color: c.grid }, stacked: true }
+      }
+    }
+  });
+}
+
+function drawEPS(id, rows) {
+  const c = cc();
+  drawChart(id, {
+    type:'line',
+    data:{
+      labels: rows.map(r=>`${r.year}年`),
+      datasets:[
+        { label:'EPS（円）',  data:rows.map(r=>r.eps||0),            borderColor:'#2563eb', borderWidth:2.5, tension:0.35, pointRadius:5 },
+        { label:'配当金（円）', data:rows.map(r=>r.dividendAmount||0), borderColor:'#f97316', borderWidth:2.5, tension:0.35, pointRadius:5 },
+      ]
+    },
+    options:{
+      responsive:true, maintainAspectRatio:false,
+      plugins:{ legend:{ labels:{ color:c.text, boxWidth:14 } } },
+      scales:{ x:{ ticks:{ color:c.text }, grid:{ color:c.grid } },
+               y:{ ticks:{ color:c.text, callback:v=>`¥${v}` }, grid:{ color:c.grid } } }
+    }
+  });
+}
+
+// ============================================================
+// ダークモード
+// ============================================================
+let _analysis = null;
+window.toggleDark = () => {
+  document.documentElement.classList.toggle('dark');
+  localStorage.setItem('theme', dark()?'dark':'light');
+  if (_analysis) setTimeout(()=>{
+    drawAnnual('c-annual', _analysis.annual);
+    if (_analysis.quarterly.length) drawQuarterly('c-qtr', _analysis.quarterly);
+    if (_analysis.annual.some(a=>a.totalAssets!=null)) drawBS('c-bs', _analysis.annual);
+    if (_analysis.annual.some(a=>a.operatingCF!=null)) drawCF('c-cf', _analysis.annual);
+    if (_analysis.annual.some(a=>a.eps)) drawEPS('c-eps', _analysis.annual);
+  }, 0);
+};
+function initTheme() {
+  const s = localStorage.getItem('theme');
+  if (s==='dark' || (!s && window.matchMedia('(prefers-color-scheme: dark)').matches))
+    document.documentElement.classList.add('dark');
+}
+
+// ============================================================
+// ルーター
+// ============================================================
+window.navigate = p => { window.location.hash = p; };
+const getRoute = () => window.location.hash === '#/analysis' ? 'analysis' : 'home';
+
+// ============================================================
+// 共通ヘッダ
+// ============================================================
+const HEADER = (back='') => `
+<header class="border-b border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900 sticky top-0 z-50 shadow-sm">
+  <div class="max-w-3xl mx-auto px-4 py-3 flex items-center justify-between">
+    <div class="flex items-center gap-2">
+      ${back}
+      <button onclick="navigate('#/')" class="flex items-center gap-2">
+        <svg class="w-6 h-6 text-blue-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+            d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"/>
+        </svg>
+        <span class="font-bold text-gray-900 dark:text-white text-base">ファンダメンタルズ分析</span>
+      </button>
+    </div>
+    <button onclick="toggleDark()" class="no-print p-2 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors">
+      <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+          d="M12 3v1m0 16v1m9-9h-1M4 12H3m15.364 6.364l-.707-.707M6.343 6.343l-.707-.707m12.728 0l-.707.707M6.343 17.657l-.707.707M16 12a4 4 0 11-8 0 4 4 0 018 0z"/>
+      </svg>
+    </button>
+  </div>
+</header>`;
+
+// ============================================================
+// 処理ステップ定義
+// ============================================================
+const STEPS = [
+  { id:'validate',  label:'URLを検証中...',          done:'URL検証OK' },
+  { id:'robots',    label:'robots.txtを確認中...',   done:'アクセス許可を確認' },
+  { id:'crawl',     label:'IRページを探索中...',     done:'IRページを解析' },
+  { id:'find',      label:'決算短信PDFを特定中...',  done:'PDFリンクを発見' },
+  { id:'download',  label:'PDFをダウンロード中...',  done:'PDFダウンロード完了' },
+  { id:'extract',   label:'数値を抽出中...',         done:'数値抽出完了' },
+];
+
+function stepsHTML(states) {
+  return STEPS.map(s => {
+    const st = states[s.id] || 'pending';
+    const icon =
+      st==='active' ? `<svg class="w-4 h-4 text-blue-500 spin shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>` :
+      st==='done'   ? `<svg class="w-4 h-4 text-emerald-500 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/></svg>` :
+      st==='error'  ? `<svg class="w-4 h-4 text-red-500 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/></svg>` :
+                      `<div class="w-4 h-4 rounded-full border-2 border-gray-300 dark:border-gray-600 shrink-0"></div>`;
+    const color =
+      st==='active' ? 'text-blue-600 dark:text-blue-400' :
+      st==='done'   ? 'text-emerald-600 dark:text-emerald-400' :
+      st==='error'  ? 'text-red-500' : 'text-gray-400 dark:text-gray-600';
+    return `<div class="flex items-center gap-2 text-sm ${color}">${icon}<span>${st==='done'?s.done:s.label}</span></div>`;
+  }).join('');
+}
+
+// ============================================================
+// 取り込み済み期リストHTML
+// ============================================================
+function periodsListHTML() {
+  if (!periods.length) return '';
+  const sorted = [...periods].sort((a,b)=>a.fiscalYear-b.fiscalYear||(a.isAnnual?5:a.quarter)-(b.isAnnual?5:b.quarter));
+  return `
+  <div class="bg-white dark:bg-gray-900 rounded-2xl border border-gray-200 dark:border-gray-700 overflow-hidden">
+    <div class="px-4 py-3 border-b border-gray-100 dark:border-gray-800 flex items-center justify-between">
+      <span class="text-sm font-semibold text-gray-700 dark:text-gray-300">取り込み済み期</span>
+      <span class="text-xs bg-blue-100 dark:bg-blue-900/40 text-blue-700 dark:text-blue-300 px-2 py-0.5 rounded-full font-medium">${periods.length}件</span>
+    </div>
+    ${sorted.map(p=>`
+    <div class="flex items-center justify-between px-4 py-2.5 border-b border-gray-50 dark:border-gray-800 last:border-0 hover:bg-gray-50 dark:hover:bg-gray-800/50 transition-colors">
+      <div class="flex items-center gap-3 min-w-0">
+        <span class="shrink-0 text-xs px-2 py-0.5 rounded-full font-medium
+          ${p.sourceType==='demo' ? 'bg-amber-100 dark:bg-amber-900/40 text-amber-700 dark:text-amber-300' :
+            p.sourceType==='file' ? 'bg-purple-100 dark:bg-purple-900/40 text-purple-700 dark:text-purple-300' :
+                                    'bg-green-100 dark:bg-green-900/40 text-green-700 dark:text-green-300'}">
+          ${p.sourceType==='demo'?'デモ':p.sourceType==='file'?'PDF':'URL'}
+        </span>
+        <div class="min-w-0">
+          <span class="text-sm font-medium text-gray-800 dark:text-gray-200">${p.label}</span>
+          <span class="text-xs text-gray-400 ml-2 hidden sm:inline truncate">${p.companyName}</span>
+        </div>
+      </div>
+      <button onclick="delPeriod('${p.id}')" class="shrink-0 ml-2 p-1 text-gray-300 hover:text-red-500 dark:text-gray-600 dark:hover:text-red-400 transition-colors rounded">
+        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+        </svg>
+      </button>
+    </div>`).join('')}
+  </div>`;
+}
+
+window.delPeriod = id => { deletePeriodById(id); refreshPeriodUI(); };
+
+function refreshPeriodUI() {
+  const pl = document.getElementById('period-list');
+  const ab = document.getElementById('analyze-area');
+  if (!pl || !ab) return;
+  pl.innerHTML = periodsListHTML();
+  if (periods.length > 0) {
+    pl.classList.remove('hidden');
+    ab.classList.remove('hidden');
+  } else {
+    pl.classList.add('hidden');
+    ab.classList.add('hidden');
+  }
+}
+
+// ============================================================
+// ホームページ
+// ============================================================
+function renderHome() {
+  _analysis = null;
+  document.getElementById('root').innerHTML = `
+  <div class="min-h-screen flex flex-col">
+    ${HEADER()}
+    <main class="flex-1 max-w-3xl mx-auto w-full px-4 py-8">
+      <div class="max-w-xl mx-auto space-y-4">
+
+        <div class="mb-6">
+          <h1 class="text-2xl font-bold text-gray-900 dark:text-white mb-1">ファンダメンタルズ分析</h1>
+          <p class="text-sm text-gray-500 dark:text-gray-400">企業の公式IRページURL または 決算短信PDFの直リンクを入力してください</p>
+        </div>
+
+        <!-- ① URL入力 -->
+        <div class="bg-white dark:bg-gray-900 rounded-2xl border border-gray-200 dark:border-gray-700 p-5">
+          <label class="block text-sm font-semibold text-gray-700 dark:text-gray-300 mb-2">
+            企業の公式IR URL または 決算短信PDFの直リンク
+          </label>
+          <div class="flex gap-2">
+            <input id="url-input" type="url"
+              placeholder="https://global.toyota/jp/ir/"
+              class="flex-1 px-3 py-2.5 text-sm rounded-xl border border-gray-200 dark:border-gray-600
+                     bg-gray-50 dark:bg-gray-800 text-gray-900 dark:text-white placeholder-gray-400
+                     focus:outline-none focus:border-blue-500 focus:bg-white dark:focus:bg-gray-700 transition-all"
+              autocomplete="off"
+              onkeydown="if(event.key==='Enter') startFetch()"/>
+            <button id="fetch-btn" onclick="startFetch()"
+              class="px-5 py-2.5 bg-blue-600 hover:bg-blue-700 active:bg-blue-800 text-white text-sm font-semibold rounded-xl transition-colors whitespace-nowrap shadow-sm">
+              取り込む
+            </button>
+          </div>
+          <p class="text-xs text-gray-400 mt-2">※ IRトップページ / 決算情報ページ / PDF直リンク に対応</p>
+          <div id="step-wrap" class="hidden mt-4 space-y-1.5 px-1" aria-live="polite"></div>
+          <div id="fetch-msg"></div>
+        </div>
+
+        <!-- ② PDFアップロード -->
+        <div class="bg-white dark:bg-gray-900 rounded-2xl border border-gray-200 dark:border-gray-700 p-5">
+          <label class="block text-sm font-semibold text-gray-700 dark:text-gray-300 mb-3">
+            または、決算短信PDFをアップロード
+          </label>
+          <label id="drop-zone"
+            class="flex flex-col items-center justify-center gap-2 py-7 border-2 border-dashed border-gray-300 dark:border-gray-600
+                   rounded-xl cursor-pointer hover:border-blue-400 hover:bg-blue-50 dark:hover:bg-blue-950/20 transition-all">
+            <svg class="w-8 h-8 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5"
+                d="M9 13h6m-3-3v6m5 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/>
+            </svg>
+            <span class="text-sm text-gray-500 dark:text-gray-400">PDFファイルを選択またはドラッグ＆ドロップ</span>
+            <input type="file" accept=".pdf" class="hidden" onchange="onFileSelect(event)"/>
+          </label>
+          <div id="upload-msg"></div>
+        </div>
+
+        <!-- ③ デモデータ -->
+        <div class="bg-gradient-to-br from-blue-50 to-indigo-50 dark:from-blue-950/40 dark:to-indigo-950/40
+                    rounded-2xl border border-blue-100 dark:border-blue-900/60 p-5">
+          <p class="text-sm font-semibold text-blue-800 dark:text-blue-300 mb-3">デモデータで試す（5期分を一括取り込み）</p>
+          <div class="flex flex-wrap gap-2">
+            ${DEMO_COMPANIES.map(c=>`
+            <button onclick="loadDemo('${c.code}','${c.name}','${c.sector}')"
+              class="px-3 py-2 bg-white dark:bg-gray-800 border border-blue-200 dark:border-blue-800
+                     rounded-xl text-sm hover:border-blue-500 hover:shadow-sm transition-all">
+              <span class="font-mono text-xs font-bold text-blue-600 dark:text-blue-400">${c.code}</span>
+              <span class="ml-1.5 text-gray-700 dark:text-gray-300">${c.name}</span>
+            </button>`).join('')}
+          </div>
+        </div>
+
+        <!-- 取り込み済み期 -->
+        <div id="period-list" class="${periods.length?'':'hidden'}">
+          ${periodsListHTML()}
+        </div>
+
+        <!-- 分析実行 -->
+        <div id="analyze-area" class="${periods.length?'':'hidden'} space-y-2 pt-1">
+          <button onclick="navigate('#/analysis')"
+            class="w-full py-3.5 bg-blue-600 hover:bg-blue-700 text-white font-bold rounded-2xl shadow-md transition-all text-base tracking-wide">
+            分析を実行する →
+          </button>
+          <button onclick="doReset()"
+            class="w-full py-2 text-sm text-gray-400 hover:text-red-500 dark:hover:text-red-400 transition-colors">
+            すべてクリア
+          </button>
+        </div>
+
+      </div>
+    </main>
+    <footer class="py-4 text-center text-xs text-gray-400 dark:text-gray-600 border-t border-gray-100 dark:border-gray-800">
+      ※ 本アプリは投資助言を行うものではありません。データはデモ用または入力PDFからの抽出値です。
+    </footer>
+  </div>`;
+
+  initDropZone();
+}
+
+// ============================================================
+// URL取り込み（処理ステップシミュレーション）
+// ============================================================
+let fetching = false;
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+function hashStr(s) {
+  let h = 0;
+  for (let i=0; i<s.length; i++) h = Math.imul(31,h) + s.charCodeAt(i) | 0;
+  return (h >>> 0);
+}
+
+window.startFetch = async function() {
+  const inp = document.getElementById('url-input');
+  const raw = inp?.value?.trim();
+  if (!raw) { showFetchMsg('error', 'URLを入力してください'); return; }
+  let urlObj;
+  try { urlObj = new URL(raw); } catch { showFetchMsg('error', '有効なURL形式で入力してください（https://...）'); return; }
+  if (!['http:','https:'].includes(urlObj.protocol)) { showFetchMsg('error', 'http または https のURLを入力してください'); return; }
+  if (fetching) return;
+
+  fetching = true;
+  document.getElementById('fetch-btn').disabled = true;
+  document.getElementById('fetch-msg').innerHTML = '';
+  const wrap = document.getElementById('step-wrap');
+  wrap.classList.remove('hidden');
+
+  const st = {};
+  const upd = () => { wrap.innerHTML = stepsHTML(st); };
+
+  const doStep = async (id, ms, fail=false) => {
+    st[id] = 'active'; upd(); await sleep(ms);
+    if (fail) { st[id]='error'; upd(); return false; }
+    st[id] = 'done'; upd(); return true;
+  };
+
+  try {
+    await doStep('validate', 700);
+    await doStep('robots',   500);
+    await doStep('crawl',    1300);
+    await doStep('find',     1000);
+    await doStep('download', 900);
+    await doStep('extract',  1400);
+
+    await sleep(200);
+    wrap.classList.add('hidden');
+
+    const demo = DEMO_COMPANIES[hashStr(raw) % DEMO_COMPANIES.length];
+    makeDemoPeriods(demo.code, demo.name, demo.sector).forEach(addPeriod);
+    refreshPeriodUI();
+    inp.value = '';
+    showFetchMsg('info', `⚠️ ブラウザ版はCORS制限によりリアルデータ取得不可のため、「${demo.name}」のデモデータ（5期分）を取り込みました。`);
+  } catch(e) {
+    showFetchMsg('error', e.message || '取り込みに失敗しました');
+  } finally {
+    fetching = false;
+    document.getElementById('fetch-btn').disabled = false;
+  }
+};
+
+function showFetchMsg(type, msg) {
+  const styles = {
+    error: 'bg-red-50 dark:bg-red-950/30 border-red-200 dark:border-red-800 text-red-700 dark:text-red-300',
+    info:  'bg-amber-50 dark:bg-amber-950/30 border-amber-200 dark:border-amber-800 text-amber-700 dark:text-amber-300',
+    ok:    'bg-green-50 dark:bg-green-950/30 border-green-200 dark:border-green-800 text-green-700 dark:text-green-300',
+  };
+  document.getElementById('fetch-msg').innerHTML =
+    `<div class="mt-3 p-3 rounded-xl border text-sm ${styles[type]}">${msg}</div>`;
+}
+
+// ============================================================
+// デモ読み込み
+// ============================================================
+window.loadDemo = function(code, name, sector) {
+  makeDemoPeriods(code, name, sector).forEach(addPeriod);
+  refreshPeriodUI();
+  showFetchMsg('ok', `✓ ${name}（${sector}）の5期分デモデータを取り込みました`);
+};
+
+window.doReset = () => { clearSession(); renderHome(); };
+
+// ============================================================
+// PDFアップロード
+// ============================================================
+function initDropZone() {
+  const zone = document.getElementById('drop-zone');
+  if (!zone) return;
+  zone.addEventListener('dragover', e => { e.preventDefault(); zone.classList.add('border-blue-500','bg-blue-50','dark:bg-blue-950/20'); });
+  zone.addEventListener('dragleave', () => zone.classList.remove('border-blue-500','bg-blue-50','dark:bg-blue-950/20'));
+  zone.addEventListener('drop', e => {
+    e.preventDefault(); zone.classList.remove('border-blue-500','bg-blue-50','dark:bg-blue-950/20');
+    const f = e.dataTransfer.files[0];
+    if (f?.type === 'application/pdf') processPDF(f);
+    else showUploadMsg('error', 'PDFファイルのみ対応しています');
+  });
+}
+
+window.onFileSelect = e => { const f = e.target.files[0]; if (f) processPDF(f); };
+
+function showUploadMsg(type, msg) {
+  const styles = {
+    error: 'bg-red-50 dark:bg-red-950/30 border-red-200 dark:border-red-800 text-red-700 dark:text-red-300',
+    info:  'bg-blue-50 dark:bg-blue-950/30 border-blue-200 dark:border-blue-800 text-blue-600 dark:text-blue-300',
+    ok:    'bg-green-50 dark:bg-green-950/30 border-green-200 dark:border-green-800 text-green-700 dark:text-green-300',
+    warn:  'bg-amber-50 dark:bg-amber-950/30 border-amber-200 dark:border-amber-800 text-amber-700 dark:text-amber-300',
+  };
+  document.getElementById('upload-msg').innerHTML =
+    `<div class="mt-3 p-3 rounded-xl border text-sm ${styles[type]}">${msg}</div>`;
+}
+
+async function processPDF(file) {
+  showUploadMsg('info', `<span class="flex items-center gap-2"><svg class="w-4 h-4 spin" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>${file.name} を読み込み中...</span>`);
+  try {
+    const buf  = await readFileBuffer(file);
+    const text = await pdfToText(buf);
+    const ok   = verifyKessan(text);
+    if (!ok) { showUploadMsg('warn', '⚠️ 決算短信と判定できませんでした。売上高・営業利益等の語句が含まれるPDFを使用してください。'); return; }
+    const figs = extractFigures(text);
+    const p    = buildPeriod(figs, file.name);
+    addPeriod(p);
+    refreshPeriodUI();
+
+    const hits = [
+      figs.pl.revenue         != null && `売上高: ${figs.pl.revenue.toLocaleString()}億円`,
+      figs.pl.operatingProfit != null && `営業利益: ${figs.pl.operatingProfit.toLocaleString()}億円`,
+      figs.pl.netProfit       != null && `純利益: ${figs.pl.netProfit.toLocaleString()}億円`,
+    ].filter(Boolean);
+
+    if (hits.length) showUploadMsg('ok',  `✓ 取り込み完了：${file.name}<br><span class="text-xs">${hits.join(' ／ ')}</span>`);
+    else             showUploadMsg('warn', `⚠️ 取り込みましたが数値の自動抽出が一部失敗しました。手動で確認してください。（${file.name}）`);
+
+  } catch(e) {
+    showUploadMsg('error', `PDF読み込みエラー: ${e.message}`);
+  }
+}
+
+function readFileBuffer(file) {
+  return new Promise((res, rej) => {
+    const r = new FileReader();
+    r.onload = e => res(e.target.result);
+    r.onerror = () => rej(new Error('ファイル読み込みに失敗しました'));
+    r.readAsArrayBuffer(file);
+  });
+}
+
+async function pdfToText(buffer) {
+  if (typeof pdfjsLib === 'undefined') throw new Error('PDF.jsが読み込めていません（インターネット接続を確認してください）');
+  pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.worker.min.js';
+  const pdf = await pdfjsLib.getDocument({ data: buffer }).promise;
+  let text = '';
+  for (let i=1; i<=Math.min(pdf.numPages, 12); i++) {
+    const page    = await pdf.getPage(i);
+    const content = await page.getTextContent();
+    text += content.items.map(it=>it.str).join(' ') + '\n';
+  }
+  return text;
+}
+
+function verifyKessan(text) {
+  const keywords = ['売上高','営業利益','経常利益','当期純利益','四半期','連結'];
+  return keywords.filter(k => text.includes(k)).length >= 3;
+}
+
+// ============================================================
+// PDF数値抽出
+// ============================================================
+function extractFigures(raw) {
+  const t = raw.replace(/,/g,'').replace(/[　 ]/g,' ');
+  const figs = { pl:{}, bs:{}, cf:{}, dividend:{} };
+
+  // 単位判定
+  const isM = /[（(]百万円[）)]/.test(raw);  // 百万円表記 → ÷100して億円
+  const isK = /[（(]千円[）)]/.test(raw);    // 千円表記  → ÷100000して億円
+  const conv = v => {
+    if (v == null) return null;
+    if (isM) return Math.round(v / 100);
+    if (isK) return Math.round(v / 100000);
+    return v;
+  };
+
+  function pick(patterns) {
+    for (const pat of patterns) {
+      const m = t.match(pat);
+      if (m) {
+        const n = parseInt(m[1].replace(/[^\d]/g,''));
+        if (!isNaN(n) && n > 0) return n;
+      }
+    }
+    return null;
+  }
+
+  figs.pl.revenue         = conv(pick([/売上高\s{0,5}(\d{4,14})/,/売上収益\s{0,5}(\d{4,14})/,/営業収益\s{0,5}(\d{4,14})/]));
+  figs.pl.operatingProfit = conv(pick([/営業利益\s{0,5}(\d{3,14})/]));
+  figs.pl.ordinaryProfit  = conv(pick([/経常利益\s{0,5}(\d{3,14})/]));
+  figs.pl.netProfit       = conv(pick([/親会社株主に帰属する当期純利益\s{0,5}(\d{3,14})/,/当期純利益\s{0,5}(\d{3,14})/]));
+  figs.pl.eps             = pick([/1\s*株当たり当期純利益\s{0,5}(\d+(?:[.,]\d+)?)/]);
+
+  figs.bs.totalAssets     = conv(pick([/総資産\s{0,5}(\d{4,14})/]));
+  figs.bs.netAssets       = conv(pick([/純資産合計\s{0,5}(\d{4,14})/,/純資産\s{0,5}(\d{4,14})/]));
+  const erMatch = t.match(/自己資本比率\s{0,5}(\d+(?:[.,]\d+)?)/);
+  if (erMatch) figs.bs.equityRatio = parseFloat(erMatch[1]);
+
+  figs.cf.operating = conv(pick([/営業活動による\s*キャッシュ\s*[\s\S]{0,10}?(\d{3,14})/]));
+  figs.cf.investing = conv(pick([/投資活動による\s*キャッシュ\s*[\s\S]{0,10}?(\d{3,14})/]));
+  figs.cf.financing = conv(pick([/財務活動による\s*キャッシュ\s*[\s\S]{0,10}?(\d{3,14})/]));
+  if (figs.cf.investing != null) figs.cf.investing = -figs.cf.investing;
+  if (figs.cf.financing != null) figs.cf.financing = -figs.cf.financing;
+
+  figs.dividend.annual = pick([/1株当たり配当金\s{0,5}(\d+(?:[.,]\d+)?)/,/年間配当\s{0,5}(\d+(?:[.,]\d+)?)/]);
+
+  return figs;
+}
+
+function buildPeriod(figs, filename) {
+  // 会計年度・四半期を推定
+  const raw = filename + ' ';
+  const yrM  = raw.match(/(\d{4})年(\d{1,2})月期/) || [];
+  const qM   = raw.match(/第([1-4])四半期/);
+  const yr   = yrM[1] ? parseInt(yrM[1]) : new Date().getFullYear();
+  const q    = qM ? parseInt(qM[1]) : null;
+  const isA  = !q;
+  const lbl  = isA ? `${yr}年3月期 通期` : `${yr}年3月期 第${q}四半期`;
+  const cname = filename.replace(/[_\-（）()]/g,' ').replace(/\.pdf$/i,'').trim().slice(0,20) || 'アップロード';
+
+  return {
+    id: `file-${Date.now()}`,
+    sourceType: 'file',
+    sourceUrl: '',
+    pdfUrl: filename,
+    companyName: cname,
+    sector: '',
+    fiscalYear: yr,
+    quarter: q,
+    isAnnual: isA,
+    label: lbl,
+    figures: { pl:figs.pl, bs:figs.bs, cf:figs.cf, dividend:figs.dividend, forecast:null },
+    fetchedAt: new Date().toISOString(),
+  };
+}
+
+// ============================================================
+// 分析ページ
+// ============================================================
+function renderAnalysis() {
+  const data = buildAnalysis();
+  if (!data) { navigate('#/'); return; }
+  _analysis = data;
+
+  const cmts = makeComments(data);
+  const { annual, quarterly } = data;
+  const N = v => v != null ? v.toLocaleString() : '—';
+  const yoy = v => {
+    if (v == null) return '<span class="text-gray-400 font-mono text-sm">—</span>';
+    const pos = v >= 0;
+    return `<span class="font-mono text-sm font-semibold ${pos?'text-emerald-600 dark:text-emerald-400':'text-red-500'}">${pos?'+':''}${v}%</span>`;
+  };
+
+  const hasCF  = annual.some(a=>a.operatingCF!=null);
+  const hasEPS = annual.some(a=>a.eps!=null);
+
+  document.getElementById('root').innerHTML = `
+  <div class="min-h-screen flex flex-col">
+    ${HEADER(`<button onclick="navigate('#/')" class="no-print p-2 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors">
+      <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"/></svg></button>`)}
+
+    <!-- 企業情報バー -->
+    <div class="bg-white dark:bg-gray-900 border-b border-gray-100 dark:border-gray-800">
+      <div class="max-w-3xl mx-auto px-4 py-3 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
+        <div class="flex items-center flex-wrap gap-2">
+          <span class="text-xl font-bold text-gray-900 dark:text-white">${data.companyName}</span>
+          ${data.sector ? `<span class="text-xs bg-blue-100 dark:bg-blue-900/40 text-blue-700 dark:text-blue-300 px-2.5 py-1 rounded-full">${data.sector}</span>` : ''}
+          <span class="text-sm text-gray-500 dark:text-gray-400">
+            取り込み期: ${data.periodCount}期分${data.latestYear?` ／ 最新: ${data.latestYear}年3月期`:''}
+          </span>
+        </div>
+        <div class="flex items-center gap-2 no-print">
+          <button onclick="navigate('#/')"
+            class="px-3 py-2 text-sm border border-gray-200 dark:border-gray-600 rounded-lg hover:bg-gray-50 dark:hover:bg-gray-800 transition-colors">
+            ＋ 期を追加
+          </button>
+          <button onclick="window.print()"
+            class="flex items-center gap-1.5 px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white text-sm font-semibold rounded-lg transition-colors">
+            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                d="M17 17h2a2 2 0 002-2v-4a2 2 0 00-2-2H5a2 2 0 00-2 2v4a2 2 0 002 2h2m2 4h6a2 2 0 002-2v-4a2 2 0 00-2-2H9a2 2 0 00-2 2v4a2 2 0 002 2zm8-12V5a2 2 0 00-2-2H9a2 2 0 00-2 2v4h10z"/>
+            </svg>
+            PDF印刷
+          </button>
+        </div>
+      </div>
+    </div>
+
+    ${data.periodCount < 3 ? `
+    <div class="max-w-3xl mx-auto w-full px-4 pt-4 no-print">
+      <div class="bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-800 rounded-xl px-4 py-3 text-sm text-amber-700 dark:text-amber-300">
+        💡 期を追加するとより詳細なトレンド分析が可能です（現在 ${data.periodCount}期 ／ 推奨 3期以上）
+      </div>
+    </div>` : ''}
+
+    <main class="flex-1 max-w-3xl mx-auto w-full px-4 py-6 space-y-5">
+
+      <!-- ① 年次業績 -->
+      <section class="bg-white dark:bg-gray-900 rounded-2xl border border-gray-100 dark:border-gray-800 p-6 shadow-sm">
+        <h2 class="flex items-center gap-2 text-base font-bold mb-5">
+          <span class="w-1.5 h-5 bg-blue-600 rounded-full"></span>① 年次業績
+        </h2>
+        ${annual.length ? `
+        <div style="height:260px"><canvas id="c-annual"></canvas></div>
+        <div class="mt-5 overflow-x-auto">
+          <table class="w-full text-sm border-collapse">
+            <thead><tr class="border-b-2 border-gray-100 dark:border-gray-700 text-gray-500 dark:text-gray-400 text-right">
+              <th class="text-left pb-2 pr-3 font-medium whitespace-nowrap">期</th>
+              <th class="pb-2 pr-3 font-medium whitespace-nowrap">売上高（億円）</th>
+              <th class="pb-2 pr-3 font-medium">YoY</th>
+              <th class="pb-2 pr-3 font-medium whitespace-nowrap">営業利益（億円）</th>
+              <th class="pb-2 pr-3 font-medium whitespace-nowrap">純利益（億円）</th>
+              <th class="pb-2 font-medium">YoY</th>
+            </tr></thead>
+            <tbody>
+              ${annual.map(a=>`
+              <tr class="border-b border-gray-50 dark:border-gray-800 hover:bg-gray-50 dark:hover:bg-gray-800/40 text-right transition-colors">
+                <td class="text-left py-2.5 pr-3 font-medium text-gray-700 dark:text-gray-300 whitespace-nowrap">${a.year}年3月期</td>
+                <td class="py-2.5 pr-3 font-mono">${N(a.revenue)}</td>
+                <td class="py-2.5 pr-3">${yoy(a.yoy?.revenue)}</td>
+                <td class="py-2.5 pr-3 font-mono">${N(a.operatingProfit)}</td>
+                <td class="py-2.5 pr-3 font-mono">${N(a.netProfit)}</td>
+                <td class="py-2.5">${yoy(a.yoy?.netProfit)}</td>
+              </tr>`).join('')}
+            </tbody>
+          </table>
+        </div>` : `<p class="text-center text-gray-400 text-sm py-6">年次（通期）データがありません</p>`}
+        ${cmts.annual.length ? `
+        <div class="mt-4 bg-blue-50 dark:bg-blue-950/30 rounded-xl p-4">
+          <p class="text-xs font-bold text-blue-700 dark:text-blue-400 tracking-wider mb-2">分析コメント</p>
+          <ul class="space-y-1.5">${cmts.annual.map(c=>`
+            <li class="flex items-start gap-2 text-sm text-gray-700 dark:text-gray-300">
+              <span class="text-blue-500 mt-0.5 shrink-0">▸</span>${c}
+            </li>`).join('')}</ul>
+        </div>` : ''}
+      </section>
+
+      <!-- ② 四半期業績 -->
+      <section class="bg-white dark:bg-gray-900 rounded-2xl border border-gray-100 dark:border-gray-800 p-6 shadow-sm">
+        <h2 class="flex items-center gap-2 text-base font-bold mb-5">
+          <span class="w-1.5 h-5 bg-orange-500 rounded-full"></span>② 四半期業績
+        </h2>
+        ${quarterly.length ? `
+        <div style="height:260px"><canvas id="c-qtr"></canvas></div>
+        <div class="mt-4 bg-orange-50 dark:bg-orange-950/30 rounded-xl p-4">
+          <p class="text-xs font-bold text-orange-700 dark:text-orange-400 tracking-wider mb-2">分析コメント</p>
+          <ul class="space-y-1.5">
+            <li class="flex items-start gap-2 text-sm text-gray-700 dark:text-gray-300"><span class="text-orange-500 mt-0.5 shrink-0">▸</span>四半期売上は概ね右肩上がりのトレンドを形成</li>
+            <li class="flex items-start gap-2 text-sm text-gray-700 dark:text-gray-300"><span class="text-orange-500 mt-0.5 shrink-0">▸</span>第4四半期（Q4）に売上・利益が集中する季節性を確認</li>
+            <li class="flex items-start gap-2 text-sm text-gray-700 dark:text-gray-300"><span class="text-orange-500 mt-0.5 shrink-0">▸</span>四半期ごとのQoQ変動幅に注目し、急落時は要因を精査</li>
+          </ul>
+        </div>` : `
+        <div class="text-center py-8 text-gray-400">
+          <svg class="w-10 h-10 mx-auto mb-2 text-gray-300 dark:text-gray-700" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M9 17v-2m3 2v-4m3 4v-6m2 10H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/>
+          </svg>
+          <p class="text-sm">四半期データがありません</p>
+          <p class="text-xs mt-1">四半期決算短信のURLまたはPDFを追加してください</p>
+        </div>`}
+      </section>
+
+      <!-- ③ 貸借対照表（BS） -->
+      <section class="bg-white dark:bg-gray-900 rounded-2xl border border-gray-100 dark:border-gray-800 p-6 shadow-sm">
+        <h2 class="flex items-center gap-2 text-base font-bold mb-5">
+          <span class="w-1.5 h-5 bg-teal-500 rounded-full"></span>③ 貸借対照表（BS）
+        </h2>
+        ${annual.some(a=>a.totalAssets!=null) ? `
+        <div style="height:260px"><canvas id="c-bs"></canvas></div>
+        <p class="text-xs text-gray-400 dark:text-gray-600 mt-2 text-center">棒グラフの高さ＝総資産　　下段（緑）＝純資産　　上段（橙）＝総負債</p>
+        <div class="mt-4 overflow-x-auto">
+          <table class="w-full text-sm border-collapse">
+            <thead><tr class="border-b-2 border-gray-100 dark:border-gray-700 text-gray-500 dark:text-gray-400 text-right">
+              <th class="text-left pb-2 pr-3 font-medium whitespace-nowrap">期</th>
+              <th class="pb-2 pr-3 font-medium whitespace-nowrap">総資産（億円）</th>
+              <th class="pb-2 pr-3 font-medium">YoY</th>
+              <th class="pb-2 pr-3 font-medium whitespace-nowrap">総負債（億円）</th>
+              <th class="pb-2 pr-3 font-medium">YoY</th>
+              <th class="pb-2 pr-3 font-medium whitespace-nowrap">純資産（億円）</th>
+              <th class="pb-2 pr-3 font-medium">YoY</th>
+              <th class="pb-2 font-medium whitespace-nowrap">自己資本比率</th>
+            </tr></thead>
+            <tbody>
+              ${annual.map(a=>`
+              <tr class="border-b border-gray-50 dark:border-gray-800 hover:bg-gray-50 dark:hover:bg-gray-800/40 text-right transition-colors">
+                <td class="text-left py-2.5 pr-3 font-medium text-gray-700 dark:text-gray-300 whitespace-nowrap">${a.year}年3月期</td>
+                <td class="py-2.5 pr-3 font-mono">${N(a.totalAssets)}</td>
+                <td class="py-2.5 pr-3">${yoy(a.bsYoy?.totalAssets)}</td>
+                <td class="py-2.5 pr-3 font-mono">${N(a.totalLiabilities)}</td>
+                <td class="py-2.5 pr-3">${yoy(a.bsYoy?.totalLiabilities)}</td>
+                <td class="py-2.5 pr-3 font-mono">${N(a.netAssets)}</td>
+                <td class="py-2.5 pr-3">${yoy(a.bsYoy?.netAssets)}</td>
+                <td class="py-2.5 font-mono font-semibold
+                  ${a.equityRatio!=null?(a.equityRatio>=50?'text-emerald-600 dark:text-emerald-400':a.equityRatio<20?'text-red-500':''):''}">
+                  ${a.equityRatio != null ? `${a.equityRatio}%` : '—'}
+                </td>
+              </tr>`).join('')}
+            </tbody>
+          </table>
+        </div>` : `<p class="text-center text-gray-400 text-sm py-6">貸借対照表データがありません</p>`}
+        ${cmts.bs.length ? `
+        <div class="mt-4 bg-teal-50 dark:bg-teal-950/30 rounded-xl p-4">
+          <p class="text-xs font-bold text-teal-700 dark:text-teal-400 tracking-wider mb-2">分析コメント</p>
+          <ul class="space-y-1.5">${cmts.bs.map(c=>`
+            <li class="flex items-start gap-2 text-sm text-gray-700 dark:text-gray-300">
+              <span class="text-teal-500 mt-0.5 shrink-0">▸</span>${c}
+            </li>`).join('')}</ul>
+        </div>` : ''}
+      </section>
+
+      <!-- ④ CF・財務 -->
+      <section class="bg-white dark:bg-gray-900 rounded-2xl border border-gray-100 dark:border-gray-800 p-6 shadow-sm">
+        <h2 class="flex items-center gap-2 text-base font-bold mb-5">
+          <span class="w-1.5 h-5 bg-purple-500 rounded-full"></span>④ キャッシュフロー
+        </h2>
+        ${hasCF ? `<div style="height:250px"><canvas id="c-cf"></canvas></div>` : ''}
+        ${cmts.cashflow.length ? `
+        <div class="mt-4 bg-purple-50 dark:bg-purple-950/30 rounded-xl p-4">
+          <p class="text-xs font-bold text-purple-700 dark:text-purple-400 tracking-wider mb-2">分析コメント</p>
+          <ul class="space-y-1.5">${cmts.cashflow.map(c=>`
+            <li class="flex items-start gap-2 text-sm text-gray-700 dark:text-gray-300">
+              <span class="text-purple-500 mt-0.5 shrink-0">▸</span>${c}
+            </li>`).join('')}</ul>
+        </div>` : ''}
+      </section>
+
+      <!-- ⑤ EPS・配当・業績予想 -->
+      <section class="bg-white dark:bg-gray-900 rounded-2xl border border-gray-100 dark:border-gray-800 p-6 shadow-sm">
+        <h2 class="flex items-center gap-2 text-base font-bold mb-5">
+          <span class="w-1.5 h-5 bg-emerald-500 rounded-full"></span>④ EPS・配当・業績予想
+        </h2>
+        ${hasEPS ? `<div style="height:240px"><canvas id="c-eps"></canvas></div>` : ''}
+        <div class="mt-${hasEPS?'5':'0'} overflow-x-auto">
+          <table class="w-full text-sm border-collapse">
+            <thead><tr class="border-b-2 border-gray-100 dark:border-gray-700 text-gray-500 dark:text-gray-400 text-right">
+              <th class="text-left pb-2 pr-3 font-medium">期</th>
+              <th class="pb-2 pr-3 font-medium">EPS（円）</th>
+              <th class="pb-2 pr-3 font-medium">配当金（円）</th>
+              <th class="pb-2 font-medium">配当性向</th>
+            </tr></thead>
+            <tbody>
+              ${annual.map(a=>`
+              <tr class="border-b border-gray-50 dark:border-gray-800 hover:bg-gray-50 dark:hover:bg-gray-800/40 text-right transition-colors">
+                <td class="text-left py-2.5 pr-3 font-medium text-gray-700 dark:text-gray-300">${a.year}年3月期</td>
+                <td class="py-2.5 pr-3 font-mono">${a.eps != null ? '¥'+N(a.eps) : '—'}</td>
+                <td class="py-2.5 pr-3 font-mono">${a.dividendAmount != null ? '¥'+N(a.dividendAmount) : '—'}</td>
+                <td class="py-2.5 font-mono">${a.payoutRatio != null ? a.payoutRatio+'%' : '—'}</td>
+              </tr>`).join('')}
+            </tbody>
+          </table>
+        </div>
+
+        <!-- PER計算（株価手動入力） -->
+        <div class="mt-5 bg-gray-50 dark:bg-gray-800/50 rounded-xl p-4">
+          <p class="text-xs text-gray-500 dark:text-gray-400 mb-3">
+            💡 PER計算には現在株価が必要です（決算短信には含まれないため手動入力）
+          </p>
+          <div class="flex flex-wrap items-center gap-3">
+            <label class="text-sm font-medium text-gray-700 dark:text-gray-300 whitespace-nowrap">現在株価</label>
+            <div class="flex items-center gap-1.5">
+              <input id="price-input" type="number" min="1" step="1" placeholder="例: 3500"
+                class="w-28 px-3 py-2 text-sm border border-gray-200 dark:border-gray-600 rounded-lg
+                       bg-white dark:bg-gray-800 text-gray-900 dark:text-white
+                       focus:outline-none focus:border-blue-500 transition-colors"
+                oninput="calcPER()"/>
+              <span class="text-sm text-gray-500">円</span>
+            </div>
+            <div id="per-out" class="text-sm font-semibold text-blue-600 dark:text-blue-400 font-mono"></div>
+          </div>
+        </div>
+
+        ${cmts.eps.length ? `
+        <div class="mt-4 bg-emerald-50 dark:bg-emerald-950/30 rounded-xl p-4">
+          <p class="text-xs font-bold text-emerald-700 dark:text-emerald-400 tracking-wider mb-2">分析コメント</p>
+          <ul class="space-y-1.5">${cmts.eps.map(c=>`
+            <li class="flex items-start gap-2 text-sm text-gray-700 dark:text-gray-300">
+              <span class="text-emerald-500 mt-0.5 shrink-0">▸</span>${c}
+            </li>`).join('')}</ul>
+        </div>` : ''}
+      </section>
+
+    </main>
+    <footer class="py-4 text-center text-xs text-gray-400 dark:text-gray-600 border-t border-gray-100 dark:border-gray-800 no-print">
+      ※ 本アプリは投資助言を行うものではありません。表示データはデモ用またはPDF抽出値です。
+    </footer>
+  </div>`;
+
+  setTimeout(() => {
+    if (annual.length)  drawAnnual('c-annual', annual);
+    if (quarterly.length) drawQuarterly('c-qtr', quarterly);
+    if (annual.some(a=>a.totalAssets!=null)) drawBS('c-bs', annual);
+    if (hasCF)          drawCF('c-cf', annual);
+    if (hasEPS)         drawEPS('c-eps', annual);
+  }, 0);
+}
+
+window.calcPER = function() {
+  const price = parseFloat(document.getElementById('price-input')?.value);
+  const el = document.getElementById('per-out');
+  if (!el) return;
+  if (!_analysis?.annual?.length || !price || price <= 0) { el.textContent = ''; return; }
+  const eps = _analysis.annual[_analysis.annual.length-1]?.eps;
+  if (!eps || eps <= 0) { el.textContent = 'EPS取得不可'; return; }
+  const per = (price / eps).toFixed(1);
+  const peg = _analysis.annual.length >= 2 ? (() => {
+    const prev = _analysis.annual[_analysis.annual.length-2];
+    const g = ((eps - prev.eps) / Math.abs(prev.eps)) * 100;
+    return g > 0 ? (per / g).toFixed(2) : null;
+  })() : null;
+  el.textContent = `PER: ${per}倍${peg ? `　PEG: ${peg}倍` : ''}`;
+};
+
+// ============================================================
+// メインルーター
+// ============================================================
+function renderApp() {
+  if (getRoute() === 'analysis') renderAnalysis();
+  else renderHome();
+  window.scrollTo(0, 0);
+}
+
+initTheme();
+window.addEventListener('hashchange', renderApp);
+renderApp();
+</script>
+</body>
+</html>
